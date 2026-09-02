@@ -784,8 +784,16 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
 }
 
 static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
-    int idx = find_peer_by_key(ml, update->public_key);
-    if (idx < 0) return;
+    /* PeersRemoved identifies the peer by NodeID (#42); the authoritative
+     * sweep and the legacy nodekey form identify it by public key. */
+    int idx = update->has_node_id ? find_peer_by_node_id(ml, update->node_id)
+                                  : find_peer_by_key(ml, update->public_key);
+    if (idx < 0) {
+        if (update->has_node_id)
+            ESP_LOGW(TAG, "PeersRemoved for unknown NodeID=%llu — ignored",
+                     (unsigned long long)update->node_id);
+        return;
+    }
 
     /* Remove from wireguard-lwip */
     if (ml->wg_netif && ml->peers[idx].wg_peer_index >= 0) {

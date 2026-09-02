@@ -10,6 +10,9 @@ once a `1.0.0` release is cut. While the version is still in the `0.x` range,
 
 ## [Unreleased]
 
+### Fixed
+- **Peers removed by the control plane now disappear immediately instead of at the next full netmap** ([#42](https://github.com/Csontikka/esphome-tailscale/issues/42)). `MapResponse.PeersRemoved` is an array of NodeIDs (integers) per `tailcfg`, and that is what both Tailscale and Headscale send — but the parser expected `nodekey:` strings and silently skipped every element. A node deleted from the tailnet (or otherwise removed) therefore stayed in the peer table, kept being probed and DISCO-pinged, and only went away when a full netmap arrived (reconnect or reboot) and the v0.5.5 authoritative sweep caught it — which on a stable connection can take days. Numeric entries are now resolved by NodeID (the string form is kept as a fallback). Verified on Headscale: deleting a node while the device is connected now removes the peer and its NVS cache entry within a second (`Peer removed: … ` + `Removing cached peer: …`), with no reconnect needed, and it stays gone across a reboot. Found running the v0.5.6 release tests; the handler has been like this since the initial vendoring, so every earlier release is affected.
+
 ## [0.5.6] — 2026-09-01
 
 ### Added

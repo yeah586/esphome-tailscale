@@ -1890,7 +1890,11 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     }
 
 check_removed:
-    /* Handle PeersRemoved — array of nodekey strings (long-poll delta updates) */
+    /* Handle PeersRemoved (long-poll delta updates). Per tailcfg this is
+     * []NodeID — integers — and that is what both Tailscale and Headscale
+     * send ("PeersRemoved":[59]); the peer slot is resolved by node_id in
+     * wg_mgr (#42). A nodekey-string element is still accepted as a
+     * fallback, but no control plane is known to send that form. */
     cJSON *removed = cJSON_GetObjectItem(root, "PeersRemoved");
     if (removed && cJSON_IsArray(removed)) {
         int rm_count = cJSON_GetArraySize(removed);
@@ -1898,20 +1902,26 @@ check_removed:
 
         cJSON *key_item;
         cJSON_ArrayForEach(key_item, removed) {
-            if (!key_item->valuestring) continue;
+            if (!cJSON_IsNumber(key_item) && !key_item->valuestring) continue;
 
             ml_peer_update_t *update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
             if (!update) continue;
 
             update->action = ML_PEER_REMOVE;
 
-            const char *hex = key_item->valuestring;
-            if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-            hex_to_bytes(hex, update->public_key, 32);
-
-            ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
-                     update->public_key[0], update->public_key[1],
-                     update->public_key[2], update->public_key[3]);
+            if (cJSON_IsNumber(key_item)) {
+                update->has_node_id = true;
+                update->node_id = (uint64_t)(int64_t)key_item->valuedouble;
+                ESP_LOGI(TAG, "  Remove peer: NodeID=%llu",
+                         (unsigned long long)update->node_id);
+            } else {
+                const char *hex = key_item->valuestring;
+                if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
+                hex_to_bytes(hex, update->public_key, 32);
+                ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
+                         update->public_key[0], update->public_key[1],
+                         update->public_key[2], update->public_key[3]);
+            }
 
             if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
                 free(update);
