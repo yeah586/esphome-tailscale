@@ -421,6 +421,7 @@ tailscale:
   max_peers: 16                          # optional, default 16, range 1–64
   login_server: ""                       # optional, empty → Tailscale SaaS; set for Headscale / self-hosted
   netcheck_override: false               # optional, default false — pick the DERP region by measured latency
+  netmap_buffer_kb: 128                  # optional — shrink the netmap buffers on a small-PSRAM board
 ```
 
 | Option | Default | Description |
@@ -432,6 +433,7 @@ tailscale:
 | `disable_telemetry` | `false` | Set to `true` to turn off the anonymous telemetry (see [Telemetry](#telemetry)). |
 | `netcheck_override` | `false` | Measure the round-trip time to every DERP region and use the fastest one as the node's home relay, instead of the region the control plane reports. See *Picking the DERP region* below before enabling. |
 | `netcheck_override_threshold` | `50ms` | Only switch when the measured region is at least this much faster than the current one. Ignored unless `netcheck_override` is `true`. Prevents flapping between regions with near-identical latency. |
+| `netmap_buffer_kb` | *(unset → 512)* | Size in KB of **each** of the two PSRAM buffers used to fetch the netmap (HTTP/2 receive + JSON parse), so roughly twice this much contiguous PSRAM at once. The 512 KB default is sized for 300+ peer tailnets. On a 2 MB-PSRAM board, or one sharing PSRAM with a display/audio component, that allocation can fail and the device never gets past registration — set `128` (ample below ~50 peers). Range 64–2048. Leave unset unless you need it. |
 
 > **No `update_interval`.** The component is fully event-driven: sensors publish only when the underlying state actually changes. There is no polling loop to tune — and nothing to reduce CPU/network cost by raising.
 
@@ -798,6 +800,30 @@ After flashing, the `Device Memory` sensor should report `PSRAM XXkB` and the VP
 A few forks patch the component to hardcode the detected PSRAM size to `0` (forcing the "no PSRAM" code path), hoping it enables a small-buffer mode. **That small-buffer mode was never implemented**, so the patch only guarantees the device can't connect — don't do it. If `Device Memory` reads `Internal RAM` on a board that *does* have PSRAM, that's a PSRAM init/config issue (see the section above), not a reason to bypass the check.
 
 Use any ESP32 with PSRAM (e.g. ESP32-S3 `N8R8` / `N16R8` / `N8R2` / `N16R2`).
+
+### Registration succeeds but the device never connects (`MapRequest failed, will retry`)
+
+If the log shows a clean registration (`Registered as User.ID=…`) and then `MapRequest failed, will retry` **within a few milliseconds** of `[TIMING] MapRequest send`, looping forever, the netmap buffers could not be allocated. Fetching the netmap needs two PSRAM buffers of `netmap_buffer_kb` each (512 KB by default): on a 2 MB-PSRAM board, or one where a display/audio/camera component already holds most of PSRAM, the allocation returns NULL and the fetch fails instantly — a network round-trip could never fail that fast.
+
+From v0.5.7 the cause is stated explicitly in the log (`cannot allocate … KB - PSRAM free … KB (largest block … KB)`), and a warning is printed at boot when the free PSRAM already looks too small. The fix is to lower the buffers:
+
+```yaml
+tailscale:
+  netmap_buffer_kb: 128     # each buffer; ample for tailnets below ~50 peers
+```
+
+On an older release the same thing can be done through the ESP-IDF options directly:
+
+```yaml
+esp32:
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ML_H2_BUFFER_SIZE_KB: "128"
+      CONFIG_ML_JSON_BUFFER_SIZE_KB: "128"
+```
+
+If it still fails at 128 KB, the board genuinely has no room left — free PSRAM elsewhere in the config, or move Tailscale to its own board.
 
 ### Auth key expired
 

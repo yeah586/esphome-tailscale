@@ -8,6 +8,7 @@
 #endif
 #include "esp_psram.h"
 #include "esp_heap_caps.h"
+#include "sdkconfig.h"
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -68,6 +69,26 @@ void TailscaleComponent::setup() {
   if (psram_size > 0) {
     this->psram_available_ = true;
     ESP_LOGI(TAG, "PSRAM detected: %u KB - using large buffers", (unsigned)(psram_size / 1024));
+    // #45: the two MapResponse buffers are compile-time sizes (Kconfig; YAML
+    // `netmap_buffer_kb`). Say what this build needs and warn early when the
+    // PSRAM that is free right now cannot hold it - the alternative is a
+    // silent "MapRequest failed, will retry" loop after a successful register.
+    // Other components may still allocate after us, so this is a preflight,
+    // not a guarantee; microlink logs the definitive error at allocation time.
+    {
+      const unsigned h2_kb = CONFIG_ML_H2_BUFFER_SIZE_KB;
+      const unsigned json_kb = CONFIG_ML_JSON_BUFFER_SIZE_KB;
+      const unsigned biggest_kb = h2_kb > json_kb ? h2_kb : json_kb;
+      const unsigned free_kb = (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+      const unsigned largest_kb = (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024);
+      ESP_LOGI(TAG, "Netmap buffers: %u KB + %u KB (PSRAM free now: %u KB, largest block %u KB)",
+               h2_kb, json_kb, free_kb, largest_kb);
+      if (largest_kb < biggest_kb || free_kb < h2_kb + json_kb + 128) {
+        ESP_LOGW(TAG, "Free PSRAM is too small or too fragmented for the netmap buffers - the netmap fetch "
+                      "will fail after registration. Set `netmap_buffer_kb: 128` (enough below ~50 peers) "
+                      "or free PSRAM held by other components.");
+      }
+    }
   } else {
     this->psram_available_ = false;
     ESP_LOGE(TAG, "No PSRAM detected — Tailscale requires PSRAM and will NOT connect on this board.");

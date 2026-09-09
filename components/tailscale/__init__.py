@@ -40,6 +40,7 @@ CONF_DISABLE_TELEMETRY = "disable_telemetry"
 CONF_NETCHECK_OVERRIDE = "netcheck_override"
 CONF_NETCHECK_OVERRIDE_THRESHOLD = "netcheck_override_threshold"
 CONF_IPN_VERSION = "ipn_version"
+CONF_NETMAP_BUFFER_KB = "netmap_buffer_kb"
 tailscale_ns = cg.esphome_ns.namespace("tailscale")
 TailscaleComponent = tailscale_ns.class_("TailscaleComponent", cg.Component)
 
@@ -66,6 +67,16 @@ CONFIG_SCHEMA = cv.Schema(
         # Set it only to clear the admin console's "Device is too old" gate,
         # e.g. ipn_version: "1.98.9". See README (Troubleshooting).
         cv.Optional(CONF_IPN_VERSION, default=""): cv.string,
+        # Size (KB) of EACH of the two PSRAM buffers microlink allocates for a
+        # netmap fetch (HTTP/2 receive + JSON parse), i.e. about twice this much
+        # contiguous PSRAM at once. The Kconfig default (512) is sized for
+        # 300+ peer tailnets; on a 2 MB-PSRAM board that shares PSRAM with
+        # other components the 2 x 512 KB allocation fails and every
+        # MapRequest dies within milliseconds of a successful registration
+        # (#45). 128 is plenty below ~50 peers. No default here on purpose:
+        # unset leaves the Kconfig value (and any sdkconfig_options override)
+        # untouched, so existing builds do not change.
+        cv.Optional(CONF_NETMAP_BUFFER_KB): cv.int_range(min=64, max=2048),
     }
 )
 
@@ -100,6 +111,15 @@ async def to_code(config):
     # runtime config to that compile-time ceiling. Propagate the YAML value into
     # sdkconfig so the compiled ceiling matches the runtime intent.
     add_idf_sdkconfig_option("CONFIG_ML_MAX_PEERS", config[CONF_MAX_PEERS])
+
+    # Both MapResponse buffers are compile-time Kconfig sizes (microlink_internal.h
+    # derives ML_H2_BUFFER_SIZE / ML_JSON_BUFFER_SIZE from them). One YAML knob
+    # sets both - the Kconfig help says to keep them equal. Only emitted when the
+    # user asked for it, so the Kconfig default / a manual sdkconfig_options
+    # override keeps working unchanged (#45).
+    if CONF_NETMAP_BUFFER_KB in config:
+        add_idf_sdkconfig_option("CONFIG_ML_H2_BUFFER_SIZE_KB", config[CONF_NETMAP_BUFFER_KB])
+        add_idf_sdkconfig_option("CONFIG_ML_JSON_BUFFER_SIZE_KB", config[CONF_NETMAP_BUFFER_KB])
 
     # Sensors are created via platform YAML files (binary_sensor.py, text_sensor.py, sensor.py)
     # They are auto-loaded and auto-configured - user doesn't need to add them manually

@@ -12,3 +12,6 @@ include_fix/
 # telemetry deploy artifacts (not secrets, but local)
 telemetry/.d1-id
 telemetry/.wrangler/
+
+# Local agent scratch — never commit
+.scratch/
