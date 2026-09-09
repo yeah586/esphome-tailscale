@@ -825,6 +825,10 @@ esp32:
 
 If it still fails at 128 KB, the board genuinely has no room left — free PSRAM elsewhere in the config, or move Tailscale to its own board.
 
+### The device reboots every 30–40 s after connecting, and an OTA "reverts itself"
+
+If the serial log ends with `task_wdt: Task watchdog got triggered … - loopTask` and `CPU 1: ml_wg_mgr`, a peer is probing this node hard enough that the DISCO/WireGuard manager starved ESPHome's main loop for more than 5 seconds. Since v0.5.7 the manager budgets its work per iteration so the main loop always gets CPU, and logs one `DISCO: N packets in 10 s …` line per 10 seconds while it lasts; if you still see that line reporting many packets per second, look for the peer that never completes a WireGuard session with this node ([#46](https://github.com/Csontikka/esphome-tailscale/issues/46)). Note that the ESPHome API log stream drops the last lines before an abort — only the UART shows the watchdog report.
+
 ### Auth key expired
 
 Symptom: the log shows `State: ERROR` / `REGISTERING` failing after a fresh flash, the `VPN Connected` binary sensor never turns on, and the admin console (Tailscale or Headplane) shows no new machine. This usually means the pre-authentication key you baked into the firmware has expired or been revoked.
