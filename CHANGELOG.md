@@ -10,6 +10,8 @@ once a `1.0.0` release is cut. While the version is still in the `0.x` range,
 
 ## [Unreleased]
 
+## [0.5.7] — 2026-09-09
+
 ### Added
 - **`netmap_buffer_kb`: fit the netmap fetch on a small-PSRAM board** ([#45](https://github.com/Csontikka/esphome-tailscale/issues/45)). Fetching the tailnet map allocates two PSRAM buffers — HTTP/2 receive and JSON parse — sized by a compile-time Kconfig default of 512 KB each, chosen for 300+ peer tailnets. On a 2 MB-PSRAM board, or one sharing PSRAM with a display/audio pipeline, ~1 MB of contiguous PSRAM is not there: the allocation returns NULL and every netmap fetch fails, so the device registers successfully and then never connects. The new option sets both buffers from YAML (`netmap_buffer_kb: 128` is ample below ~50 peers). **Unset by default** — existing builds keep the 512 KB sizing and a manual `sdkconfig_options` override still wins, so nothing changes for anyone not setting it.
 
