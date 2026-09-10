@@ -10,6 +10,9 @@ once a `1.0.0` release is cut. While the version is still in the `0.x` range,
 
 ## [Unreleased]
 
+### Fixed
+- **A reconnect could crash the node, and every reconnect leaked ~650 KB of PSRAM.** `microlink_stop()` slept a fixed 3 s and then let `microlink_destroy()` free the instance under any task still running — a coord task still inside the map long-poll after those 3 s died in the freed memory (PANIC in `poll_map_update`). And `destroy` never released the long-poll accumulators (two netmap-sized PSRAM buffers) nor the DERP TLS state, so each stop/start cycle — the *Reconnect* button, a WiFi flap — lost ~650 KB; measured on the reference router: 5.12 → 4.27 → 3.62 → 2.97 MB free over three clean reconnects, about eight flaps from an out-of-memory device. Every task now signs off before it exits, `stop` waits for all of them (bounded at 15 s; if one is still running the instance is leaked deliberately instead of freed under it), and `destroy` frees the buffers and the TLS state once they are quiescent.
+
 ## [0.5.10] — 2026-09-10
 
 ### Fixed

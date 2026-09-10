@@ -728,6 +728,7 @@ void ml_derp_tx_task(void *arg) {
     }
 
     ESP_LOGI(TAG, "DERP I/O task exiting");
+    ml_task_exiting(ml);
     vTaskDelete(NULL);
 }
 
@@ -769,6 +770,7 @@ void ml_derp_rx_task(void *arg) {
         if (!got) vTaskDelay(pdMS_TO_TICKS(10));   /* idle: don't hot-spin (O_NONBLOCK) */
     }
     ESP_LOGI(TAG, "DERP RX task exiting");
+    ml_task_exiting(ml);
     vTaskDelete(NULL);
 }
 
