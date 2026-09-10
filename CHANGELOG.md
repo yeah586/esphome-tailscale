@@ -10,6 +10,8 @@ once a `1.0.0` release is cut. While the version is still in the `0.x` range,
 
 ## [Unreleased]
 
+## [0.5.10] — 2026-09-10
+
 ### Fixed
 - **The admin console lost the client version after every reconnect.** `ipn_version` was only put into two of the four Hostinfo messages (register, initial map); the long-poll MapRequest and the endpoint update carried a Hostinfo without `IPNVersion`, and the control plane keeps the last Hostinfo it receives — so the version set in YAML showed up briefly and then vanished, re-arming the console's "Device is too old" gate. All four now carry it.
 
