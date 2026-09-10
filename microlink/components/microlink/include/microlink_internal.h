@@ -125,6 +125,14 @@ extern "C" {
 #define ML_DISCO_PING_TIMEOUT_MS        5000
 #define ML_DISCO_UPGRADE_INTERVAL_MS    15000
 #define ML_DISCO_SESSION_ACTIVE_MS      45000
+/* Per-peer DISCO backoff (esphome-tailscale#46, direction 3). The reference
+ * client heartbeats a peer only while it has traffic for it
+ * (sessionActiveTimeout) and never answers a CallMeMaybe with one of its own.
+ * microlink used to heartbeat every peer with a direct path every 3 s for
+ * ever and to echo every CallMeMaybe, so two microlink nodes that never
+ * completed a WireGuard session kept each other busy indefinitely. */
+#define ML_DISCO_CMM_BURST_FLOOR_MS     2500    /* min spacing of CallMeMaybe-triggered ping bursts, per peer */
+#define ML_DISCO_BEST_STICKY_MS         6500    /* keep best_ip/port while it answered this recently (trustUDPAddrDuration) */
 
 /* STUN servers (Tailscale primary, Google fallback) */
 #define ML_STUN_PRIMARY_HOST    "derp9.tailscale.com"
@@ -325,6 +333,20 @@ typedef struct {
     uint64_t trust_until_ms;        /* Direct path trusted until */
     uint64_t last_send_ms;          /* Last data sent to this peer */
     uint64_t last_upgrade_ms;       /* Last path upgrade attempt */
+    uint64_t last_cmm_rx_ms;        /* Last CallMeMaybe-triggered ping burst (floor) */
+    uint64_t best_last_pong_ms;     /* Last direct PONG that came from best_ip:best_port itself */
+
+    /* DISCO shared secret with this peer (NaCl box beforenm of our disco
+     * private key and the peer's disco key), derived once and reused for
+     * every DISCO packet in both directions -- reference client:
+     * discoInfo.sharedKey. It used to be recomputed per packet: one X25519,
+     * ~16 ms on an ESP32-S3, which is what made every DISCO packet and every
+     * manager tick with two heartbeats in it expensive. disco_shared_for[]
+     * remembers the disco key it was derived from, so a rotation arriving by
+     * any netmap path re-derives it on next use. */
+    uint8_t disco_shared[32];
+    uint8_t disco_shared_for[32];
+    bool disco_shared_valid;
 
     /* Best direct path */
     uint32_t best_ip;

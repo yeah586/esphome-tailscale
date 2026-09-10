@@ -475,6 +475,20 @@ static int find_peer_by_disco_key(microlink_t *ml, const uint8_t *disco_key) {
     return -1;
 }
 
+/* Shared DISCO secret with peer p, derived on first use and again after the
+ * peer's disco key changed (see ml_peer_t.disco_shared). NULL on failure. */
+static const uint8_t *disco_shared_key(microlink_t *ml, ml_peer_t *p) {
+    if (!p->disco_shared_valid || memcmp(p->disco_shared_for, p->disco_key, 32) != 0) {
+        if (nacl_box_beforenm(p->disco_shared, p->disco_key, ml->disco_private_key) != 0) {
+            p->disco_shared_valid = false;
+            return NULL;
+        }
+        memcpy(p->disco_shared_for, p->disco_key, 32);
+        p->disco_shared_valid = true;
+    }
+    return p->disco_shared;
+}
+
 static int find_peer_by_node_id(microlink_t *ml, uint64_t node_id) {
     if (node_id == 0) return -1;
     for (int i = 0; i < ml->peer_count; i++) {
@@ -707,6 +721,9 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->last_pong_recv_ms = 0;
     p->trust_until_ms = 0;
     p->last_send_ms = 0;
+    p->last_cmm_rx_ms = 0;
+    p->best_last_pong_ms = 0;
+    p->disco_shared_valid = false;
     p->last_upgrade_ms = 0;
     p->has_direct_path = false;
     p->best_ip = 0;
@@ -901,8 +918,9 @@ static void disco_build_ping(microlink_t *ml, int peer_idx,
 
     /* Encrypt with NaCl box: our disco private key -> peer's disco public key */
     uint8_t ciphertext[46 + NACL_BOX_MACBYTES];
-    nacl_box(ciphertext, plaintext, sizeof(plaintext), nonce,
-             p->disco_key, ml->disco_private_key);
+    const uint8_t *shared = disco_shared_key(ml, p);
+    if (!shared) { *out_len = 0; return; }
+    nacl_box_afternm(ciphertext, plaintext, sizeof(plaintext), nonce, shared);
 
     /* Build packet: magic(6) + our_disco_pubkey(32) + nonce(24) + ciphertext(62) = 124 bytes */
     size_t pos = 0;
@@ -977,8 +995,9 @@ static void disco_build_pong(microlink_t *ml, int peer_idx,
 
     /* Encrypt */
     uint8_t ciphertext[32 + NACL_BOX_MACBYTES];
-    nacl_box(ciphertext, plaintext, sizeof(plaintext), nonce,
-             p->disco_key, ml->disco_private_key);
+    const uint8_t *shared = disco_shared_key(ml, p);
+    if (!shared) { *out_len = 0; return; }
+    nacl_box_afternm(ciphertext, plaintext, sizeof(plaintext), nonce, shared);
 
     /* Build packet */
     size_t pos = 0;
@@ -1081,6 +1100,15 @@ static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
     ESP_LOGD(TAG, "DISCO PING from %s (via %s)",
              p->hostname, pkt->via_derp ? "DERP" : "direct");
 
+    /* Nothing is sent from here beyond the PONG below -- a PING must not
+     * trigger a PING, or two nodes chase each other. (The reference client
+     * also files the source as a candidate endpoint; that is deliberately
+     * not done here: without latency-based path selection a second
+     * answering address makes best_ip/best_port flap between the two and,
+     * with no data flowing, every flap forces a WireGuard handshake --
+     * observed with a NAT'd container peer whose pings leave from a port
+     * other than its listening one.) */
+
     /* Build PONG */
     uint8_t pong[256];
     size_t pong_len = 0;
@@ -1164,10 +1192,35 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
 
         p->last_pong_recv_ms = now;
 
-        /* If direct reply, update best path */
+        /* If direct reply, update best path -- but stick to the current one
+         * while it still answers. A peer can answer from two addresses (its
+         * LAN address and its public NAT mapping are both in the netmap and
+         * both get our ping; a NAT may also flip ports), and following every
+         * PONG made best_ip/best_port flap between them; with no data
+         * flowing, every flap forced a WireGuard handshake below (measured:
+         * one per 3 s toward such a peer). The reference client keeps
+         * bestAddr while it is trusted (trustUDPAddrDuration, 6.5 s) and
+         * only moves on clearly better latency; without per-endpoint
+         * latency here the rule is: keep the best while it answered within
+         * that window, let another address take over once it went quiet. */
+        if (!pkt->via_derp && pkt->src_ip != 0 && p->has_direct_path &&
+            (p->best_ip != pkt->src_ip || p->best_port != pkt->src_port) &&
+            (now - p->best_last_pong_ms) < ML_DISCO_BEST_STICKY_MS) {
+            ESP_LOGD(TAG, "PONG from %s via %d.%d.%d.%d:%d, keeping best %d.%d.%d.%d:%d (answered %llu ms ago)",
+                     p->hostname,
+                     (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
+                     (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF), (int)pkt->src_port,
+                     (int)((p->best_ip >> 24) & 0xFF), (int)((p->best_ip >> 16) & 0xFF),
+                     (int)((p->best_ip >> 8) & 0xFF), (int)(p->best_ip & 0xFF), (int)p->best_port,
+                     (unsigned long long)(now - p->best_last_pong_ms));
+            pending_probes[i].active = false;
+            matched = true;
+            break;
+        }
         if (!pkt->via_derp && pkt->src_ip != 0) {
             p->best_ip = pkt->src_ip;
             p->best_port = pkt->src_port;
+            p->best_last_pong_ms = now;
             p->has_direct_path = true;
             p->trust_until_ms = now + ML_DISCO_TRUST_DURATION_MS;
             /* Phase 1.5g — a direct PONG arrived; clear the DERP-only flag so
@@ -1238,9 +1291,22 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                                      (int)cur_port, (int)pkt->src_port,
                                      (unsigned)last_rx_age_ms);
                         } else {
-                            wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-                            ESP_LOGI(TAG, "WG endpoint SWITCHED to direct: %d.%d.%d.%d:%d for %s "
-                                          "(last_rx=%ums, forcing handshake)",
+                            /* No data lately either -- still no reason for a
+                             * handshake. WireGuard authenticates by key and
+                             * roams by design: the existing keypair keeps
+                             * working at the new address, and a peer that
+                             * really lost the session is caught by the WG
+                             * timers and by the DERP retry above (up != OK).
+                             * The forced handshake that used to sit here
+                             * fought wireguardif's own roaming on a
+                             * dual-homed peer -- DISCO's best said one of its
+                             * addresses, its WireGuard packets arrived from
+                             * the other, so the endpoint changed on every
+                             * heartbeat and re-handshaked every 3 s for ever.
+                             * The reference client never handshakes on an
+                             * endpoint change. */
+                            ESP_LOGD(TAG, "WG endpoint re-pointed to direct: %d.%d.%d.%d:%d for %s "
+                                          "(last_rx=%ums, session kept)",
                                      (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
                                      (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
                                      (int)pkt->src_port, p->hostname,
@@ -1342,19 +1408,41 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
 
     if (ciphertext_len < NACL_BOX_MACBYTES) return;
 
+    /* Identify the sender by its disco key BEFORE touching the crypto
+     * (reference client: discoInfoForKnownPeerLocked only for keys that
+     * belong to a peer). A key that matches no peer -- a rotation the netmap
+     * has not delivered yet, or a stranger -- is dropped without an X25519;
+     * the handlers below could do nothing with it anyway. */
+    int sender_idx = find_peer_by_disco_key(ml, sender_disco_key);
+    if (sender_idx < 0) {
+        static uint64_t last_unknown_log_ms = 0;
+        static uint32_t unknown_suppressed = 0;
+        uint64_t now_ms = ml_get_time_ms();
+        if (now_ms - last_unknown_log_ms > 10000) {
+            ESP_LOGD(TAG, "DISCO from unknown disco key %02x%02x%02x%02x... via %s dropped"
+                          " (%lu more in the last 10 s)",
+                     sender_disco_key[0], sender_disco_key[1],
+                     sender_disco_key[2], sender_disco_key[3],
+                     pkt->via_derp ? "DERP" : "direct", (unsigned long)unknown_suppressed);
+            last_unknown_log_ms = now_ms;
+            unknown_suppressed = 0;
+        } else {
+            unknown_suppressed++;
+        }
+        return;
+    }
+    const uint8_t *shared = disco_shared_key(ml, &ml->peers[sender_idx]);
+    if (!shared) return;
+
     size_t plaintext_len = ciphertext_len - NACL_BOX_MACBYTES;
     uint8_t *plaintext = malloc(plaintext_len);
     if (!plaintext) return;
 
-    if (nacl_box_open(plaintext, ciphertext, ciphertext_len, nonce,
-                      sender_disco_key, ml->disco_private_key) != 0) {
-        /* Name the claimed sender (#31): the packet carries the sender's
-         * current disco pubkey — if it matches a known peer the failure is
-         * OUR stale key material; if unknown, the sender rotated or is
-         * foreign, and the prefix lets it be correlated externally. */
-        int sender_idx = find_peer_by_disco_key(ml, sender_disco_key);
+    if (nacl_box_open_afternm(plaintext, ciphertext, ciphertext_len, nonce, shared) != 0) {
+        /* The sender is a known peer, so a MAC failure means OUR key material
+         * for it is stale (#31); the prefix lets it be correlated externally. */
         ESP_LOGW(TAG, "DISCO decrypt failed (from %s via %s, disco_key=%02x%02x%02x%02x...)",
-                 sender_idx >= 0 ? ml->peers[sender_idx].hostname : "unknown peer",
+                 ml->peers[sender_idx].hostname,
                  pkt->via_derp ? "DERP" : "direct",
                  sender_disco_key[0], sender_disco_key[1],
                  sender_disco_key[2], sender_disco_key[3]);
@@ -1393,10 +1481,31 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
                      ml->peers[peer_idx].hostname, ep_count,
                      disco_has_udp_path(ml), ml_at_socket_is_ready());
 
-            /* Reply with our own CallMeMaybe (bidirectional NAT traversal).
-             * Skip on cellular: our endpoints are behind CGNAT and unreachable. */
-            if (!ml_at_socket_is_ready()) {
-                disco_send_call_me_maybe(ml, peer_idx);
+            /* No CallMeMaybe in reply. The reference client (magicsock
+             * handleCallMeMaybe) only pings the endpoints it was given; it
+             * sends its own CallMeMaybe when IT has traffic for us and no
+             * trusted direct path. microlink used to echo one back, so two
+             * microlink nodes without a WireGuard session bounced
+             * CallMeMaybe -> ping burst -> CallMeMaybe between each other for
+             * ever (esphome-tailscale#46: ~9 DISCO packets/s from one peer).
+             * The peer learns our address from the source of the pings below
+             * and from the PONGs we send to its own pings; we learn its from
+             * the PONGs to our probes of its netmap endpoints.
+             *
+             * Per-peer floor on the burst: a well-behaved peer sends at most
+             * one CallMeMaybe per heartbeat (3 s); faster than that is an
+             * older microlink echoing ours, and every probe below costs an
+             * X25519. A suppressed burst is simply dropped: the peer's next
+             * CallMeMaybe or our next probe round covers it. */
+            ml_peer_t *cp = &ml->peers[peer_idx];
+            uint64_t cmm_now = ml_get_time_ms();
+            bool burst_ok = (cp->last_cmm_rx_ms == 0) ||
+                            (cmm_now - cp->last_cmm_rx_ms >= ML_DISCO_CMM_BURST_FLOOR_MS);
+            if (burst_ok) {
+                cp->last_cmm_rx_ms = cmm_now;
+            } else {
+                ESP_LOGD(TAG, "CallMeMaybe burst from %s suppressed (%llu ms after the previous one)",
+                         cp->hostname, (unsigned long long)(cmm_now - cp->last_cmm_rx_ms));
             }
 
             /* Probe each endpoint with a DISCO ping.
@@ -1426,6 +1535,8 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
                               ((uint32_t)entry[14] << 8) |
                               (uint32_t)entry[15];
 
+                if (!burst_ok) continue;
+
                 /* Send DISCO ping to this endpoint */
                 if (disco_has_udp_path(ml)) {
                     uint8_t ping_pkt[256];
@@ -1445,7 +1556,9 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
             }
 
             /* Also force-ping peer's known endpoints from MapResponse */
-            disco_send_ping_to_peer(ml, peer_idx, true);
+            if (burst_ok) {
+                disco_send_ping_to_peer(ml, peer_idx, true);
+            }
         }
         break;
     default:
@@ -1588,8 +1701,9 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     esp_fill_random(nonce, DISCO_NONCE_LEN);
 
     uint8_t ciphertext[sizeof(plaintext) + NACL_BOX_MACBYTES];
-    nacl_box(ciphertext, plaintext, pt_len, nonce,
-             p->disco_key, ml->disco_private_key);
+    const uint8_t *shared = disco_shared_key(ml, p);
+    if (!shared) return;
+    nacl_box_afternm(ciphertext, plaintext, pt_len, nonce, shared);
 
     /* Build packet: magic(6) + disco_pubkey(32) + nonce(24) + ciphertext */
     uint8_t pkt[256];
@@ -1794,17 +1908,25 @@ static void disco_periodic_probes(microlink_t *ml) {
                 } else {
                     /* Encrypted data ALSO stopped — the direct path is really
                      * dead. Fall back to DERP. */
-                    ESP_LOGI(TAG, "Direct path to %s expired (last_rx=%ums), "
-                                  "reverting to DERP", p->hostname,
-                             (unsigned)last_rx_age_ms);
+                    bool session_up = false;
                     if (ml->wg_netif && p->wg_peer_index >= 0) {
                         struct netif *netif = (struct netif *)ml->wg_netif;
-                        err_t is_up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
-                                                               NULL, NULL);
-                        if (is_up == ERR_OK) {
+                        session_up = (wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
+                                                             NULL, NULL) == ERR_OK);
+                        if (session_up) {
+                            ESP_LOGI(TAG, "Direct path to %s expired (last_rx=%ums), "
+                                          "reverting to DERP", p->hostname,
+                                     (unsigned)last_rx_age_ms);
                             wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
                             ESP_LOGI(TAG, "  WG session active, falling back to DERP for %s", p->hostname);
                         }
+                    }
+                    if (!session_up) {
+                        /* No WireGuard session behind this path, nothing to
+                         * fall back: this is the once-a-minute re-probe of a
+                         * session-less peer (see the heartbeat gate below). */
+                        ESP_LOGD(TAG, "Direct path to %s (no WG session): re-probe after %u s",
+                                 p->hostname, (unsigned)(ML_DISCO_TRUST_DURATION_MS / 1000));
                     }
                     /* One force-ping to try re-establishing direct path. */
                     if (!ml_at_socket_is_ready()) {
@@ -1838,7 +1960,7 @@ static void disco_periodic_probes(microlink_t *ml) {
          * throughput case (keypair valid, DISCO pings starved) is likewise
          * untouched. The 30 s attempt cadence is uniform so PONGs that clear
          * derp_fallback_active can't make us re-fire faster than every 30 s. */
-        if (p->wg_peer_index >= 0 && ml->wg_netif &&
+        if (p->wg_peer_index >= 0 && ml->wg_netif && p->online &&
             now - p->peer_added_ms > 30000) {
             struct netif *netif = (struct netif *)ml->wg_netif;
             err_t up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
@@ -1860,7 +1982,14 @@ static void disco_periodic_probes(microlink_t *ml) {
         /* Probe for direct path upgrade (every UPGRADE_INTERVAL when on DERP).
          * Skip on cellular: direct paths impossible through carrier-grade NAT.
          * Throttled to DISCO_PROBES_PER_TICK to spread load and reduce jitter. */
-        if (!ml_at_socket_is_ready() && !p->has_direct_path &&
+        /* ... and not toward a peer the netmap marks offline: nobody answers,
+         * each probe still costs an X25519 plus a DERP send, and on a
+         * 13-peer router with 8 of them offline that alone kept every
+         * 1 s tick above the 30 ms SLOW mark. p->online is the netmap
+         * Node.Online tri-state (unknown => true), so this only skips peers
+         * the control plane has explicitly reported offline; the next
+         * PeersChanged delta that flips them back re-enables probing. */
+        if (!ml_at_socket_is_ready() && !p->has_direct_path && p->online &&
             now - p->last_upgrade_ms > ML_DISCO_UPGRADE_INTERVAL_MS) {
             if (upgrade_probes_sent < DISCO_PROBES_PER_TICK) {
                 disco_send_ping_to_peer(ml, i, false);
@@ -1872,10 +2001,27 @@ static void disco_periodic_probes(microlink_t *ml) {
         /* Heartbeat on active direct paths (every HEARTBEAT interval).
          * MUST use force=true because HEARTBEAT_MS (3s) < PING_INTERVAL_MS (5s),
          * so the rate limiter would always block heartbeat pings.
-         * Heartbeats are NEVER throttled — they're time-critical for trust_until_ms. */
+         * Heartbeats are NEVER throttled — they're time-critical for trust_until_ms.
+         *
+         * Only behind a WireGuard session, though. The reference client
+         * heartbeats a peer only while it has traffic for it
+         * (sessionActiveTimeout) and sends an idle one nothing; here the
+         * heartbeat protects the single data-plane endpoint of a live session,
+         * so it runs for as long as the session does, but a peer that never
+         * completed a handshake gets no heartbeat at all -- its address is
+         * refreshed once a minute by the trust-expiry re-probe above. Before
+         * this gate every session-less peer was pinged every 3 s for ever
+         * (esphome-tailscale#46, direction 3). */
         if (p->has_direct_path &&
             now - p->last_ping_sent_ms > ml->t_disco_heartbeat_ms) {
-            disco_send_ping_to_peer(ml, i, true);
+            bool session_up = false;
+            if (ml->wg_netif && p->wg_peer_index >= 0) {
+                session_up = (wireguardif_peer_is_up((struct netif *)ml->wg_netif,
+                                                     (u8_t)p->wg_peer_index, NULL, NULL) == ERR_OK);
+            }
+            if (session_up) {
+                disco_send_ping_to_peer(ml, i, true);
+            }
         }
     }
 
