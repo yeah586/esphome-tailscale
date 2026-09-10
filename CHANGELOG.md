@@ -10,6 +10,10 @@ once a `1.0.0` release is cut. While the version is still in the `0.x` range,
 
 ## [Unreleased]
 
+### Changed
+- **Endpoint updates reach the control plane only when the endpoints changed** (reference client: `setEndpoints` gates the update with `endpointSetsEqual`). The 23 s re-STUN used to re-send an identical update every time — a fresh HTTP/2 stream for the node and a peer-change patch pushed to every peer on the tailnet — with nothing new in it. Still sent once per (re)connect regardless.
+- **One PONG per PING, back to where it came from** (reference client: `handlePingLocked`). The fan-out — the source, every LAN endpoint of the peer, plus always a copy via DERP — cost the pinger an unmatched PONG per extra copy and a DERP round trip per PING for nothing: a direct PING already proves the direct return path. DERP is used only when the direct send itself fails.
+
 ## [0.5.8] — 2026-09-10
 
 ### Changed
